@@ -21,5 +21,10 @@ shell = "auto"
 context = true
 max_context_entries = 40
 
+# Tell the model which commands exist on your PATH, so it suggests rg when you
+# have rg and grep when you do not. extra_tools adds your own to the probe list.
+tools = true
+extra_tools = []
+
 temperature = 0.2
 timeout = 120

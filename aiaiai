@@ -6,13 +6,25 @@
 
 from __future__ import annotations
 
+import sys
+
+if sys.version_info < (3, 11):
+    sys.stderr.write(
+        "aiaiai needs Python 3.11 or newer (found %d.%d).\n"
+        "  macOS:         brew install python\n"
+        "  Debian/Ubuntu: sudo apt install python3.11\n"
+        "  Fedora:        sudo dnf install python3.11\n"
+        % sys.version_info[:2]
+    )
+    raise SystemExit(1)
+
 import json
 import os
 import platform
 import re
 import shutil
+import select
 import subprocess
-import sys
 import urllib.error
 import urllib.request
 
@@ -33,6 +45,8 @@ DEFAULTS = {
     "temperature": 0.2,
     "context": True,
     "max_context_entries": 40,
+    "tools": True,
+    "extra_tools": [],
 }
 
 CONFIG_PATH = os.path.join(
@@ -41,32 +55,56 @@ CONFIG_PATH = os.path.join(
     "config.toml",
 )
 
-EXAMPLE_CONFIG = """# aiaiai configuration
+CONFIG_TEMPLATE = """# aiaiai configuration
 
 # OpenAI-compatible endpoint. The trailing /v1 is optional, both forms work.
 # Examples: http://localhost:1234/v1 (LM Studio), http://localhost:11434/v1
 # (Ollama), https://api.openai.com/v1, or your own gateway.
-base_url = "http://localhost:1234/v1"
-model    = "local-model"
-api_key  = "not-required"
+base_url = {base_url}
+model    = {model}
+api_key  = {api_key}
 
 # What aiaiai does with the answer:
 #   "command" -> print only the command
 #   "explain" -> print the command plus a short explanation
 #   "confirm" -> print it, then ask before running   (default)
 #   "auto"    -> run it immediately, no questions asked
-mode = "confirm"
+mode = {mode}
 
 # Shell used to execute commands: "auto" follows $SHELL
-shell = "auto"
+shell = {shell}
 
 # Send the working directory listing as context so the model can use real names
-context = true
-max_context_entries = 40
+context = {context}
+max_context_entries = {max_context_entries}
 
-temperature = 0.2
-timeout = 120
+# Tell the model which commands exist on your PATH, so it suggests rg when you
+# have rg and grep when you do not. extra_tools adds your own to the probe list.
+tools = {tools}
+extra_tools = {extra_tools}
+
+temperature = {temperature}
+timeout = {timeout}
 """
+
+
+def toml_str(value) -> str:
+    """Quote a value for TOML. Only the types this config actually holds."""
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_str(v) for v in value) + "]"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def render_config(cfg: dict) -> str:
+    fields = ("base_url", "model", "api_key", "mode", "shell", "context",
+              "max_context_entries", "tools", "extra_tools", "temperature", "timeout")
+    return CONFIG_TEMPLATE.format(**{k: toml_str(cfg.get(k, DEFAULTS[k])) for k in fields})
+
 
 DANGEROUS = [
     (r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR][a-zA-Z]*f|\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f[a-zA-Z]*[rR]", "recursive forced delete"),
@@ -127,6 +165,8 @@ def note(msg: str):
 def load_config(path: str | None) -> dict:
     cfg = dict(DEFAULTS)
     path = path or CONFIG_PATH
+    cfg["_config_path"] = path
+    cfg["_configured"] = os.path.exists(path)
     if os.path.exists(path):
         try:
             import tomllib
@@ -148,13 +188,20 @@ def load_config(path: str | None) -> dict:
     return cfg
 
 
-def write_example_config(path: str):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    if os.path.exists(path):
-        die(f"{path} already exists, leaving it alone")
+def save_config(path: str, cfg: dict):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w") as fh:
-        fh.write(EXAMPLE_CONFIG)
+        fh.write(render_config(cfg))
+    os.chmod(path, 0o600)  # may contain an API key
     note(f"{GREEN}wrote{RESET} {path}")
+
+
+def write_example_config(path: str):
+    if os.path.exists(path):
+        die(f"{path} already exists, leaving it alone (try: {PROG} --setup)")
+    save_config(path, dict(DEFAULTS))
 
 
 # --------------------------------------------------------------------- context
@@ -166,13 +213,65 @@ def user_shell(cfg: dict) -> str:
     return os.environ.get("SHELL") or shutil.which("bash") or "/bin/sh"
 
 
+def os_description() -> str:
+    """A name the model will recognise: "Ubuntu 24.04.1 LTS", "macOS 15.1", ..."""
+    system = platform.system()
+    if system == "Linux":
+        try:
+            fields = {}
+            with open("/etc/os-release") as fh:
+                for line in fh:
+                    if "=" in line:
+                        key, _, value = line.partition("=")
+                        fields[key.strip()] = value.strip().strip('"')
+            name = fields.get("PRETTY_NAME") or fields.get("NAME")
+            if name:
+                return f"{name} (Linux {platform.release()}, GNU userland)"
+        except OSError:
+            pass
+        return f"Linux {platform.release()} (GNU userland)"
+    if system == "Darwin":
+        return f"macOS {platform.mac_ver()[0] or platform.release()} (BSD userland, not GNU)"
+    return f"{system} {platform.release()}"
+
+
+# Tools worth telling the model about: their presence changes the right answer
+# (rg vs grep, fd vs find, gdate vs date). Cheap to probe, all PATH lookups.
+PROBE_TOOLS = [
+    "rg", "ag", "fd", "fdfind", "jq", "yq", "gawk", "sed", "gsed", "find", "xargs",
+    "rsync", "curl", "wget", "tar", "zstd", "7z", "unzip",
+    "git", "gh", "docker", "podman", "kubectl", "helm", "systemctl", "journalctl",
+    "ffmpeg", "imagemagick", "magick", "convert", "exiftool", "pdftk", "qpdf",
+    "python3", "node", "npm", "pnpm", "uv", "pipx", "cargo", "go",
+    "apt", "dnf", "pacman", "brew", "snap", "flatpak",
+    "tmux", "fzf", "bat", "eza", "exa", "tree", "ncdu", "duf", "parallel",
+]
+
+
+def available_tools(cfg: dict) -> list[str]:
+    extra = cfg.get("extra_tools") or []
+    seen, found = set(), []
+    for name in list(PROBE_TOOLS) + list(extra):
+        if name in seen:
+            continue
+        seen.add(name)
+        if shutil.which(name):
+            found.append(name)
+    return found
+
+
 def gather_context(cfg: dict, extra_paths: list[str]) -> str:
     cwd = os.getcwd()
     lines = [
         f"cwd: {cwd}",
-        f"os: {platform.system()} {platform.release()}",
+        f"os: {os_description()}",
         f"shell: {os.path.basename(user_shell(cfg))}",
     ]
+    if cfg.get("tools", True):
+        tools = available_tools(cfg)
+        if tools:
+            lines.append(f"tools on PATH: {', '.join(tools)}")
+            lines.append("only use tools from that list, or ones every unix has.")
     if not cfg.get("context", True):
         return "\n".join(lines)
 
@@ -193,6 +292,19 @@ def gather_context(cfg: dict, extra_paths: list[str]) -> str:
     return "\n".join(lines)
 
 
+def read_piped_stdin() -> str:
+    """Piped input, if any is actually waiting. Never blocks on an idle pipe."""
+    if sys.stdin is None or sys.stdin.isatty():
+        return ""
+    try:
+        ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not ready:
+            return ""
+        return sys.stdin.read(100_000).strip()
+    except (OSError, ValueError):
+        return ""
+
+
 def referenced_paths(question: str) -> list[str]:
     """Absolute paths mentioned in the question that actually exist as directories."""
     found = []
@@ -201,6 +313,156 @@ def referenced_paths(question: str) -> list[str]:
         if os.path.isdir(path) and path != os.getcwd() and path not in found:
             found.append(path)
     return found[:3]
+
+
+
+# ------------------------------------------------------------------ setup flow
+
+PRESETS = [
+    ("OpenAI", "https://api.openai.com/v1", "gpt-4o-mini", True),
+    ("Ollama (running on this machine)", "http://localhost:11434/v1", "llama3.2", False),
+    ("LM Studio (running on this machine)", "http://localhost:1234/v1", "local-model", False),
+    ("Something else (your own gateway, a server on your network)", None, None, False),
+]
+
+
+def prompt(question: str, default: str = "") -> str:
+    suffix = f" [{default}]" if default else ""
+    try:
+        answer = input(f"{question}{suffix}: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        note("\nsetup cancelled")
+        raise SystemExit(130)
+    return answer or default
+
+
+def prompt_yes_no(question: str, default: bool = True) -> bool:
+    hint = "Y/n" if default else "y/N"
+    try:
+        answer = input(f"{question} [{hint}]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        note("")
+        return False
+    if not answer:
+        return default
+    return answer in ("y", "yes")
+
+
+def prompt_choice(question: str, options: list, default: int = 1) -> int:
+    note(f"\n{BOLD}{question}{RESET}")
+    for i, label in enumerate(options, 1):
+        note(f"  {i}) {label}")
+    while True:
+        raw = prompt("choose", str(default))
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw)
+        note(f"{YELLOW}pick a number between 1 and {len(options)}{RESET}")
+
+
+def test_connection(cfg: dict) -> bool:
+    note(f"{DIM}asking {cfg['model']} to say hello...{RESET}")
+    payload = {
+        "model": cfg["model"],
+        "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+        "max_tokens": 10,
+    }
+    req = urllib.request.Request(
+        endpoint(cfg["base_url"]),
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg.get('api_key') or 'not-required'}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            json.loads(resp.read().decode())
+        note(f"{GREEN}it works.{RESET}")
+        return True
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:200]
+        note(f"{RED}the server answered HTTP {exc.code}{RESET}: {detail}")
+        if exc.code in (401, 403):
+            note("  that usually means the API key is wrong or missing.")
+        elif exc.code == 404:
+            note("  that usually means the model name or the url is wrong.")
+    except urllib.error.URLError as exc:
+        note(f"{RED}could not reach {cfg['base_url']}{RESET}: {exc.reason}")
+        note("  is the server running, and is the address right?")
+    except Exception as exc:  # noqa: BLE001
+        note(f"{RED}unexpected problem{RESET}: {exc}")
+    return False
+
+
+def setup(path: str | None) -> int:
+    path = path or CONFIG_PATH
+    if not sys.stdin.isatty():
+        die(f"--setup needs a terminal. Run '{PROG} --init' and edit {path} instead.")
+
+    cfg = dict(DEFAULTS)
+    existing = os.path.exists(path)
+    if existing:
+        cfg.update({k: v for k, v in load_config(path).items() if not k.startswith("_")})
+        note(f"{BOLD}aiaiai setup{RESET} - updating {path}")
+        note(f"{DIM}press enter to keep the current value{RESET}")
+    else:
+        note(f"{BOLD}aiaiai setup{RESET} - let's point this at an AI you can use.")
+
+    choice = prompt_choice(
+        "Where should aiaiai send your questions?",
+        [p[0] for p in PRESETS],
+        default=4 if existing else 1,
+    )
+    label, url, model, needs_key = PRESETS[choice - 1]
+
+    if url is None:
+        note(f"\n{DIM}the base url of any OpenAI-compatible API, e.g. "
+             f"https://example.com/v1{RESET}")
+        cfg["base_url"] = prompt("base url", cfg["base_url"])
+        cfg["model"] = prompt("model name", cfg["model"])
+        key = prompt("api key (leave blank if the server does not need one)", "")
+        cfg["api_key"] = key or "not-required"
+    else:
+        cfg["base_url"] = url
+        note(f"\n{DIM}using {url}{RESET}")
+        cfg["model"] = prompt("model name", model)
+        if needs_key:
+            note(f"{DIM}from https://platform.openai.com/api-keys - stored in {path}, "
+                 f"readable only by you{RESET}")
+            while True:
+                key = prompt("api key", "" if not existing else cfg.get("api_key", ""))
+                if key and key != "not-required":
+                    cfg["api_key"] = key
+                    break
+                note(f"{YELLOW}{label} needs a key to answer anything{RESET}")
+        else:
+            cfg["api_key"] = "not-required"
+
+    mode_choice = prompt_choice(
+        "What should aiaiai do with the command it comes up with?",
+        [
+            "show it and ask before running       (confirm - safest)",
+            "print only the command, run nothing  (command)",
+            "print it with a short explanation    (explain)",
+            "just run it, no questions            (auto)",
+        ],
+        default={"confirm": 1, "command": 2, "explain": 3, "auto": 4}.get(cfg.get("mode"), 1),
+    )
+    cfg["mode"] = ("confirm", "command", "explain", "auto")[mode_choice - 1]
+    note(f"{DIM}you can override this per call with -c, -e, -r, -y{RESET}")
+
+    save_config(path, cfg)
+
+    note("")
+    if prompt_yes_no("test the connection now?"):
+        if not test_connection(cfg):
+            note(f"\n{YELLOW}setup saved anyway.{RESET} Fix the details with "
+                 f"'{PROG} --setup', or edit {path}.")
+            return 1
+
+    note(f"\n{GREEN}ready.{RESET} Try it:")
+    note(f"  {BOLD}{PROG} how do I find the biggest files in this folder{RESET}")
+    return 0
 
 
 # ------------------------------------------------------------------------- api
@@ -236,6 +498,10 @@ def ask(cfg: dict, question: str, context: str) -> dict:
         detail = exc.read().decode(errors="replace")[:400]
         die(f"{cfg['base_url']} returned HTTP {exc.code}: {detail}")
     except urllib.error.URLError as exc:
+        if not cfg.get("_configured"):
+            die(f"cannot reach {cfg['base_url']}: {exc.reason}\n"
+                f"  no config file yet - run '{PROG} --setup' to point aiaiai "
+                f"at an AI you can use.")
         die(f"cannot reach {cfg['base_url']}: {exc.reason}")
     except TimeoutError:
         die("the model took too long to answer")
@@ -356,8 +622,9 @@ other options:
   -m, --model NAME   override the model for this call
       --url URL      override the OpenAI-compatible base url
       --config PATH  use a different config file
-      --no-context   do not send the directory listing
+      --no-context   do not send the directory listing or the tool list
       --force        skip the extra prompt on dangerous commands (with --yes)
+      --setup        interactive first-time configuration
       --init         write an example config to {CONFIG_PATH}
       --where        print the config path in use
   -h, --help         this text
@@ -394,6 +661,8 @@ def main(argv: list[str]) -> int:
         elif arg == "--init":
             write_example_config(config_path or CONFIG_PATH)
             return 0
+        elif arg in ("--setup", "--configure"):
+            return setup(config_path)
         elif arg == "--where":
             print(config_path or CONFIG_PATH)
             return 0
@@ -432,15 +701,15 @@ def main(argv: list[str]) -> int:
         cfg["base_url"] = url
     if no_context:
         cfg["context"] = False
+        cfg["tools"] = False
 
     mode = mode_override or cfg.get("mode", "confirm")
     if mode not in MODES:
         die(f"unknown mode {mode!r}, expected one of {', '.join(MODES)}")
 
-    if not sys.stdin.isatty():
-        piped = sys.stdin.read().strip()
-        if piped:
-            question = f"{question}\n\nInput piped to aiaiai:\n{piped[:4000]}"
+    piped = read_piped_stdin()
+    if piped:
+        question = f"{question}\n\nInput piped to {PROG}:\n{piped[:4000]}"
 
     context = gather_context(cfg, referenced_paths(question))
     answer = ask(cfg, question, context)
