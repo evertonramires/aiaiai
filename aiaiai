@@ -18,6 +18,9 @@ import urllib.request
 
 VERSION = "0.1.0"
 
+# Installed as both "aiaiai" and the short alias "ai"; usage text follows suit.
+PROG = os.path.basename(sys.argv[0]) or "aiaiai"
+
 MODES = ("command", "explain", "confirm", "auto")
 
 DEFAULTS = {
@@ -337,11 +340,11 @@ def run(command: str, cfg: dict) -> int:
 
 # ------------------------------------------------------------------------ main
 
-USAGE = f"""aiaiai {VERSION} - ask your LLM for the command you meant to type
+USAGE = f"""{PROG} {VERSION} - ask your LLM for the command you meant to type
 
 usage:
-  aiaiai <what you want to do>
-  aiaiai -r find every file bigger than 1G under /var
+  {PROG} <what you want to do>
+  {PROG} -r find every file bigger than 1G under /var
 
 output modes (default comes from the config file):
   -c, --command      print only the command
@@ -361,7 +364,7 @@ other options:
   -V, --version      version
 
 the command goes to stdout, everything else to stderr, so this works:
-  mkdir -p out && $(aiaiai -c list every png here)
+  mkdir -p out && $({PROG} -c list every png here)
 """
 
 

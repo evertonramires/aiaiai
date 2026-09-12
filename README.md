@@ -17,10 +17,20 @@ OpenAI API itself.
 
 ```sh
 git clone https://github.com/<you>/aiaiai.git
-cd aiaiai && ./install.sh   # symlinks into ~/.local/bin
+cd aiaiai && ./install.sh   # symlinks aiaiai + ai into ~/.local/bin
 aiaiai --init               # writes ~/.config/aiaiai/config.toml
 $EDITOR "$(aiaiai --where)" # point base_url and model at your endpoint
 ```
+
+`install.sh` links the tool under two names: `aiaiai` and the short alias `ai`.
+They are the same program, so use whichever you like:
+
+```sh
+ai how to mv all subfolders of /ORGANIZED into current folder
+```
+
+If `ai` is already taken on your system the installer says so and leaves it
+alone; `NO_SHORT_ALIAS=1 ./install.sh` skips it outright.
 
 ## Output modes
 
@@ -37,8 +47,8 @@ The command always goes to **stdout** and everything else to **stderr**, so
 substitution works:
 
 ```sh
-$(aiaiai -c list every png here)
-aiaiai -c archive this folder | tee last-command.sh
+$(ai -c list every png here)
+ai -c archive this folder | tee last-command.sh
 ```
 
 In `auto` mode a command matching a destructive pattern (`rm -rf`, `mkfs`,
