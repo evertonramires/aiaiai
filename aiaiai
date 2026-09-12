@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""aiaiai - ask an OpenAI-compatible LLM for the shell command you meant to type.
+
+    aiaiai how to mv all subfolders of /ORGANIZED into current folder
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+VERSION = "0.1.0"
+
+MODES = ("command", "explain", "confirm", "auto")
+
+DEFAULTS = {
+    "base_url": "http://localhost:1234/v1",
+    "model": "local-model",
+    "api_key": "not-required",
+    "mode": "confirm",
+    "shell": "auto",
+    "timeout": 120,
+    "temperature": 0.2,
+    "context": True,
+    "max_context_entries": 40,
+}
+
+CONFIG_PATH = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "aiaiai",
+    "config.toml",
+)
+
+EXAMPLE_CONFIG = """# aiaiai configuration
+
+# OpenAI-compatible endpoint. The trailing /v1 is optional, both forms work.
+# Examples: http://localhost:1234/v1 (LM Studio), http://localhost:11434/v1
+# (Ollama), https://api.openai.com/v1, or your own gateway.
+base_url = "http://localhost:1234/v1"
+model    = "local-model"
+api_key  = "not-required"
+
+# What aiaiai does with the answer:
+#   "command" -> print only the command
+#   "explain" -> print the command plus a short explanation
+#   "confirm" -> print it, then ask before running   (default)
+#   "auto"    -> run it immediately, no questions asked
+mode = "confirm"
+
+# Shell used to execute commands: "auto" follows $SHELL
+shell = "auto"
+
+# Send the working directory listing as context so the model can use real names
+context = true
+max_context_entries = 40
+
+temperature = 0.2
+timeout = 120
+"""
+
+DANGEROUS = [
+    (r"\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*[rR][a-zA-Z]*f|\brm\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*f[a-zA-Z]*[rR]", "recursive forced delete"),
+    (r"\bmkfs(\.|\s)", "filesystem format"),
+    (r"\bdd\b[^|]*\bof=/dev/", "raw write to a device"),
+    (r">\s*/dev/(sd|nvme|hd)", "raw write to a device"),
+    (r":\(\)\s*\{.*\};\s*:", "fork bomb"),
+    (r"\b(shutdown|reboot|halt|poweroff)\b", "powers the machine down"),
+    (r"\bchmod\s+(-[a-zA-Z]+\s+)*777\s+/(\s|$)", "world-writable root"),
+    (r"\b(chown|chmod)\s+-[a-zA-Z]*R[a-zA-Z]*\s+[^\s]*\s+/(\s|$)", "recursive permission change on /"),
+    (r"\bgit\s+(push\s+.*--force|reset\s+--hard)", "discards git work"),
+    (r"\bcurl\b[^|]*\|\s*(sudo\s+)?(ba|z|)sh", "pipes the internet into a shell"),
+    (r"\bdrop\s+(database|table)\b", "destroys a database"),
+    (r"\bkubectl\s+delete\b", "deletes cluster resources"),
+]
+
+SYSTEM_PROMPT = """You are aiaiai, a terminal assistant. The user describes what they want to do \
+and you reply with the single shell command that does it.
+
+Rules:
+- Reply with a JSON object and nothing else: {"command": "...", "explanation": "..."}
+- "command" is one runnable command line for the user's shell. Chain with && or ; or a one-line \
+loop if needed, but never return multiple lines and never wrap it in a code fence.
+- "explanation" is at most two short sentences saying what the command does and calling out \
+anything destructive. No markdown.
+- Prefer portable, standard tools already present on the system. Use the real file and directory \
+names from the context when they are given.
+- If the request is impossible or too vague to turn into a command, set "command" to "" and \
+explain why in "explanation".
+"""
+
+
+# ---------------------------------------------------------------- output utils
+
+def _color(code: str) -> str:
+    if os.environ.get("NO_COLOR") or not sys.stderr.isatty():
+        return ""
+    return code
+
+
+BOLD, DIM, RED, GREEN, YELLOW, RESET = (
+    _color("\033[1m"), _color("\033[2m"), _color("\033[31m"),
+    _color("\033[32m"), _color("\033[33m"), _color("\033[0m"),
+)
+
+
+def die(msg: str, code: int = 1):
+    print(f"{RED}aiaiai:{RESET} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def note(msg: str):
+    print(msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------- config
+
+def load_config(path: str | None) -> dict:
+    cfg = dict(DEFAULTS)
+    path = path or CONFIG_PATH
+    if os.path.exists(path):
+        try:
+            import tomllib
+            with open(path, "rb") as fh:
+                cfg.update(tomllib.load(fh))
+        except Exception as exc:  # noqa: BLE001
+            die(f"could not read config {path}: {exc}")
+
+    env = {
+        "base_url": "AIAIAI_BASE_URL",
+        "model": "AIAIAI_MODEL",
+        "api_key": "AIAIAI_API_KEY",
+        "mode": "AIAIAI_MODE",
+        "shell": "AIAIAI_SHELL",
+    }
+    for key, var in env.items():
+        if os.environ.get(var):
+            cfg[key] = os.environ[var]
+    return cfg
+
+
+def write_example_config(path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if os.path.exists(path):
+        die(f"{path} already exists, leaving it alone")
+    with open(path, "w") as fh:
+        fh.write(EXAMPLE_CONFIG)
+    note(f"{GREEN}wrote{RESET} {path}")
+
+
+# --------------------------------------------------------------------- context
+
+def user_shell(cfg: dict) -> str:
+    sh = cfg.get("shell", "auto")
+    if sh and sh != "auto":
+        return sh
+    return os.environ.get("SHELL") or shutil.which("bash") or "/bin/sh"
+
+
+def gather_context(cfg: dict, extra_paths: list[str]) -> str:
+    cwd = os.getcwd()
+    lines = [
+        f"cwd: {cwd}",
+        f"os: {platform.system()} {platform.release()}",
+        f"shell: {os.path.basename(user_shell(cfg))}",
+    ]
+    if not cfg.get("context", True):
+        return "\n".join(lines)
+
+    limit = int(cfg.get("max_context_entries", 40))
+    for target in [cwd] + extra_paths:
+        try:
+            entries = sorted(os.listdir(target))
+        except OSError as exc:
+            lines.append(f"contents of {target}: unavailable ({exc.strerror})")
+            continue
+        shown = []
+        for name in entries[:limit]:
+            full = os.path.join(target, name)
+            shown.append(name + ("/" if os.path.isdir(full) else ""))
+        more = f" (+{len(entries) - limit} more)" if len(entries) > limit else ""
+        label = "contents of cwd" if target == cwd else f"contents of {target}"
+        lines.append(f"{label}: {', '.join(shown) if shown else '(empty)'}{more}")
+    return "\n".join(lines)
+
+
+def referenced_paths(question: str) -> list[str]:
+    """Absolute paths mentioned in the question that actually exist as directories."""
+    found = []
+    for token in re.findall(r"(?:^|\s)(~?/[^\s'\"]+)", question):
+        path = os.path.expanduser(token.rstrip(".,;:"))
+        if os.path.isdir(path) and path != os.getcwd() and path not in found:
+            found.append(path)
+    return found[:3]
+
+
+# ------------------------------------------------------------------------- api
+
+def endpoint(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if not base.endswith("/v1"):
+        base += "/v1"
+    return base + "/chat/completions"
+
+
+def ask(cfg: dict, question: str, context: str) -> dict:
+    payload = {
+        "model": cfg["model"],
+        "temperature": float(cfg.get("temperature", 0.2)),
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": f"Context:\n{context}\n\nRequest: {question}"},
+        ],
+    }
+    req = urllib.request.Request(
+        endpoint(cfg["base_url"]),
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg.get('api_key') or 'not-required'}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=float(cfg.get("timeout", 120))) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")[:400]
+        die(f"{cfg['base_url']} returned HTTP {exc.code}: {detail}")
+    except urllib.error.URLError as exc:
+        die(f"cannot reach {cfg['base_url']}: {exc.reason}")
+    except TimeoutError:
+        die("the model took too long to answer")
+
+    try:
+        content = body["choices"][0]["message"]["content"]
+    except (KeyError, IndexError):
+        die(f"unexpected response: {json.dumps(body)[:400]}")
+    return parse_answer(content)
+
+
+def parse_answer(content: str) -> dict:
+    text = (content or "").strip()
+    # Qwen-style reasoning preamble
+    text = re.sub(r"^<think>.*?</think>", "", text, flags=re.S).strip()
+    fence = re.search(r"```(?:json|sh|bash)?\s*(.*?)```", text, flags=re.S)
+    if fence:
+        text = fence.group(1).strip()
+
+    obj = None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        brace = re.search(r"\{.*\}", text, flags=re.S)
+        if brace:
+            try:
+                obj = json.loads(brace.group(0))
+            except json.JSONDecodeError:
+                obj = None
+
+    if isinstance(obj, dict):
+        command = str(obj.get("command") or "").strip()
+        explanation = str(obj.get("explanation") or "").strip()
+    else:
+        # Model ignored the format; treat the first non-empty line as the command.
+        lines = [ln for ln in text.splitlines() if ln.strip()]
+        command = lines[0].strip() if lines else ""
+        explanation = " ".join(ln.strip() for ln in lines[1:]).strip()
+
+    command = command.strip("`").strip()
+    if command.startswith("$ "):
+        command = command[2:]
+    return {"command": command, "explanation": explanation}
+
+
+# ------------------------------------------------------------------- execution
+
+def danger(command: str) -> str | None:
+    for pattern, why in DANGEROUS:
+        if re.search(pattern, command, flags=re.I):
+            return why
+    return None
+
+
+def prompt_user(command: str, risk: str | None) -> str | None:
+    """Returns the command to run, or None to abort."""
+    if not sys.stdin.isatty():
+        note(f"{YELLOW}not a tty, refusing to run without confirmation{RESET}")
+        return None
+    while True:
+        hint = f"{RED}[{risk}]{RESET} " if risk else ""
+        try:
+            answer = input(f"{hint}run it? [y/N/e(dit)] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            note("")
+            return None
+        if answer in ("y", "yes"):
+            return command
+        if answer in ("", "n", "no", "q"):
+            return None
+        if answer in ("e", "edit"):
+            edited = edit_command(command)
+            if edited:
+                return edited
+            return None
+
+
+def edit_command(command: str) -> str | None:
+    try:
+        import readline
+        readline.set_startup_hook(lambda: readline.insert_text(command))
+        try:
+            return input("> ").strip() or None
+        finally:
+            readline.set_startup_hook()
+    except (ImportError, EOFError, KeyboardInterrupt):
+        note("")
+        return None
+
+
+def run(command: str, cfg: dict) -> int:
+    shell = user_shell(cfg)
+    note(f"{DIM}--- running ---{RESET}")
+    try:
+        return subprocess.call([shell, "-c", command])
+    except KeyboardInterrupt:
+        return 130
+    except OSError as exc:
+        die(f"could not run with {shell}: {exc}")
+        return 1
+
+
+# ------------------------------------------------------------------------ main
+
+USAGE = f"""aiaiai {VERSION} - ask your LLM for the command you meant to type
+
+usage:
+  aiaiai <what you want to do>
+  aiaiai -r find every file bigger than 1G under /var
+
+output modes (default comes from the config file):
+  -c, --command      print only the command
+  -e, --explain      print the command and a short explanation
+  -r, --run          print it and ask before running
+  -y, --yes, --auto  run it without asking
+
+other options:
+  -m, --model NAME   override the model for this call
+      --url URL      override the OpenAI-compatible base url
+      --config PATH  use a different config file
+      --no-context   do not send the directory listing
+      --force        skip the extra prompt on dangerous commands (with --yes)
+      --init         write an example config to {CONFIG_PATH}
+      --where        print the config path in use
+  -h, --help         this text
+  -V, --version      version
+
+the command goes to stdout, everything else to stderr, so this works:
+  mkdir -p out && $(aiaiai -c list every png here)
+"""
+
+
+def main(argv: list[str]) -> int:
+    mode_override = None
+    config_path = None
+    model = url = None
+    no_context = False
+    force = False
+    words: list[str] = []
+
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if words and not arg.startswith("--"):
+            words.append(arg)
+            continue
+        if arg == "--":
+            words.extend(args)
+            break
+        elif arg in ("-h", "--help"):
+            print(USAGE, file=sys.stderr)
+            return 0
+        elif arg in ("-V", "--version"):
+            print(VERSION)
+            return 0
+        elif arg == "--init":
+            write_example_config(config_path or CONFIG_PATH)
+            return 0
+        elif arg == "--where":
+            print(config_path or CONFIG_PATH)
+            return 0
+        elif arg in ("-c", "--command"):
+            mode_override = "command"
+        elif arg in ("-e", "--explain"):
+            mode_override = "explain"
+        elif arg in ("-r", "--run", "--confirm"):
+            mode_override = "confirm"
+        elif arg in ("-y", "--yes", "--auto"):
+            mode_override = "auto"
+        elif arg in ("-m", "--model"):
+            model = args.pop(0) if args else die("--model needs a value")
+        elif arg == "--url":
+            url = args.pop(0) if args else die("--url needs a value")
+        elif arg == "--config":
+            config_path = args.pop(0) if args else die("--config needs a value")
+        elif arg == "--no-context":
+            no_context = True
+        elif arg == "--force":
+            force = True
+        elif arg.startswith("-") and len(arg) > 1 and not words:
+            die(f"unknown option {arg} (use -- before a request starting with a dash)")
+        else:
+            words.append(arg)
+
+    question = " ".join(words).strip()
+    if not question:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    cfg = load_config(config_path)
+    if model:
+        cfg["model"] = model
+    if url:
+        cfg["base_url"] = url
+    if no_context:
+        cfg["context"] = False
+
+    mode = mode_override or cfg.get("mode", "confirm")
+    if mode not in MODES:
+        die(f"unknown mode {mode!r}, expected one of {', '.join(MODES)}")
+
+    if not sys.stdin.isatty():
+        piped = sys.stdin.read().strip()
+        if piped:
+            question = f"{question}\n\nInput piped to aiaiai:\n{piped[:4000]}"
+
+    context = gather_context(cfg, referenced_paths(question))
+    answer = ask(cfg, question, context)
+    command = answer["command"]
+    explanation = answer["explanation"]
+
+    if not command:
+        die(explanation or "the model did not produce a command")
+
+    risk = danger(command)
+
+    if mode == "command":
+        print(command)
+        return 0
+
+    if mode == "explain":
+        print(command)
+        if explanation:
+            note(f"{DIM}{explanation}{RESET}")
+        if risk:
+            note(f"{RED}careful:{RESET} {risk}")
+        return 0
+
+    note(f"{BOLD}{command}{RESET}")
+    if explanation:
+        note(f"{DIM}{explanation}{RESET}")
+
+    if mode == "auto" and (not risk or force):
+        return run(command, cfg)
+
+    if mode == "auto" and risk:
+        note(f"{RED}careful:{RESET} {risk} - asking anyway (use --force to skip)")
+
+    chosen = prompt_user(command, risk)
+    if chosen is None:
+        note("aborted")
+        return 130
+    return run(chosen, cfg)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
