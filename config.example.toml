@@ -1,10 +1,10 @@
 # aiaiai configuration
 
 # OpenAI-compatible endpoint. The trailing /v1 is optional, both forms work.
-# Examples: http://localhost:1234/v1 (LM Studio), http://localhost:11434/v1
-# (Ollama), https://api.openai.com/v1, or your own gateway.
-base_url = "http://localhost:1234/v1"
-model    = "local-model"
+# Examples: http://localhost:11434/v1 (Ollama), http://localhost:1234/v1
+# (LM Studio), https://api.openai.com/v1, or your own gateway.
+base_url = "http://localhost:11434/v1"
+model    = "llama3.2"
 api_key  = "not-required"
 
 # What aiaiai does with the answer:
@@ -14,10 +14,14 @@ api_key  = "not-required"
 #   "auto"    -> run it immediately, no questions asked
 mode = "confirm"
 
-# Shell used to execute commands: "auto" follows $SHELL
+# Shell used to run commands. "auto" follows $SHELL on unix and PowerShell on
+# Windows; set it to bash, zsh, fish, pwsh, ... to pin one.
 shell = "auto"
 
-# Send the working directory listing as context so the model can use real names
+# Seconds to wait for the model before giving up.
+timeout = 90
+
+# Send the working directory listing as context so the model uses real names.
 context = true
 max_context_entries = 40
 
@@ -27,4 +31,3 @@ tools = true
 extra_tools = []
 
 temperature = 0.2
-timeout = 120
