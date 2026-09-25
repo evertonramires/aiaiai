@@ -1,5 +1,12 @@
 # aiaiai configuration
 
+# Who answers:
+#   "openai"      -> any OpenAI-compatible API, set by base_url below
+#   "claude-code" -> the Claude Code CLI (claude -p), using the login you
+#                    already have there. base_url and api_key are ignored, and
+#                    model is a Claude Code model such as haiku, sonnet or opus.
+provider = "openai"
+
 # OpenAI-compatible endpoint. The trailing /v1 is optional, both forms work.
 # Examples: http://localhost:11434/v1 (Ollama), http://localhost:1234/v1
 # (LM Studio), https://api.openai.com/v1, or your own gateway.
@@ -31,3 +38,6 @@ tools = true
 extra_tools = []
 
 temperature = 0.2
+
+# The Claude Code executable, for provider = "claude-code".
+claude_bin = "claude"

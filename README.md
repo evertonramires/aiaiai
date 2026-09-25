@@ -11,7 +11,9 @@ run it? [y/N/e(dit)]
 
 One file, no dependencies, works with any OpenAI-compatible API - a local
 [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai), an OpenAI key,
-or your own gateway. Nothing is sent anywhere except the endpoint you choose.
+or your own gateway - or with the [Claude Code](https://code.claude.com/docs)
+CLI you are already logged in to. Nothing is sent anywhere except the endpoint
+you choose.
 
 ## Install
 
@@ -90,6 +92,22 @@ In `auto` mode a command that matches a destructive pattern - `rm -rf`,
 
 It is a safety net, not a guarantee. Read what you run.
 
+### With Claude Code
+
+If you have the `claude` CLI installed and logged in, aiaiai can use it instead
+of an API: no key, no endpoint, it rides on the login you already have.
+
+```sh
+ai --setup          # pick "Claude Code"
+ai --claude find every file bigger than 1G under /var   # or just for one call
+```
+
+Under the hood it runs one `claude -p` turn with every Claude Code tool turned
+off (`--tools ""`), no MCP servers and no saved session. Claude only writes the
+answer; running it stays with aiaiai and your chosen mode. The model defaults
+to `haiku`, which is quick and plenty for one command; `-m sonnet` or
+`model = "opus"` if you want it to think harder.
+
 ## Configure
 
 Run `ai --setup` any time to change anything. To edit by hand:
@@ -99,6 +117,7 @@ $EDITOR "$(ai --where)"
 ```
 
 ```toml
+provider = "openai"                      # or "claude-code"
 base_url = "http://localhost:11434/v1"   # any OpenAI-compatible endpoint
 model    = "llama3.2"
 api_key  = "not-required"
@@ -114,12 +133,15 @@ tools = true        # tell it which commands exist on your PATH
 extra_tools = []    # probe for these too
 
 temperature = 0.2
+
+claude_bin = "claude"   # the Claude Code executable, for provider = "claude-code"
 ```
 
 The file lives in `~/.config/aiaiai/config.toml`
 (`%APPDATA%\aiaiai\config.toml` on Windows) and is written `0600`, since it can
 hold an API key. Environment variables win over the file: `AIAIAI_BASE_URL`,
-`AIAIAI_MODEL`, `AIAIAI_API_KEY`, `AIAIAI_MODE`, `AIAIAI_SHELL`.
+`AIAIAI_MODEL`, `AIAIAI_API_KEY`, `AIAIAI_MODE`, `AIAIAI_SHELL`,
+`AIAIAI_PROVIDER`, `AIAIAI_CLAUDE_BIN`.
 
 ## What it tells the model
 
@@ -150,6 +172,8 @@ one call.
 -y --yes --auto   run without asking
 -m --model NAME   override the model for this call
    --url URL      override the base url
+   --claude       ask Claude Code (claude -p) for this call
+   --provider P   openai or claude-code, for this call
    --timeout SECS override how long to wait for an answer
    --config PATH  use another config file
    --no-context   skip the directory listing and tool probe
@@ -169,8 +193,9 @@ If your request starts with a dash, put `--` first:
 - **Python 3.11+**. The installer checks, and offers to install it for you.
 - **Linux, macOS or Windows.** PowerShell is supported natively: on Windows it
   writes PowerShell, and it will use `pwsh` anywhere if you set `shell = "pwsh"`.
-- **An OpenAI-compatible endpoint.** Ollama and LM Studio are free and run on
-  your own machine; an OpenAI key works too.
+- **An OpenAI-compatible endpoint, or Claude Code.** Ollama and LM Studio are
+  free and run on your own machine; an OpenAI key works too. Or install the
+  [Claude Code](https://code.claude.com/docs) CLI and log in once.
 
 ## Trouble
 
@@ -181,6 +206,8 @@ If your request starts with a dash, put `--` first:
 | `HTTP 401` | the API key is wrong - `ai --setup` |
 | `HTTP 404` | the model name or url is wrong - `ai --setup` |
 | `did not answer within 90s` | raise `timeout`, or use a smaller model |
+| `could not start Claude Code` | install the `claude` CLI, or point `claude_bin` at it |
+| `Claude Code failed` | run `claude` once and log in, then try again |
 | it suggests nonsense | a bigger model helps a lot here |
 
 ## Uninstall
