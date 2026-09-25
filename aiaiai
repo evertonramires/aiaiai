@@ -42,7 +42,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 IS_WINDOWS = os.name == "nt"
 
 
@@ -70,6 +70,7 @@ DEFAULTS = {
     "max_context_entries": 40,
     "tools": True,
     "extra_tools": [],
+    "explain_args": True,
     "claude_bin": "claude",
 }
 
@@ -101,11 +102,15 @@ model    = {model}
 api_key  = {api_key}
 
 # What aiaiai does with the answer:
+#   "confirm" -> print it with a short explanation of what it does and what
+#                each argument means, then ask before running   (default)
+#   "explain" -> the same, but never run anything
 #   "command" -> print only the command
-#   "explain" -> print the command plus a short explanation
-#   "confirm" -> print it, then ask before running   (default)
 #   "auto"    -> run it immediately, no questions asked
 mode = {mode}
+
+# Break the command down argument by argument ("-r  include subfolders").
+explain_args = {explain_args}
 
 # Shell used to run commands. "auto" follows $SHELL on unix and PowerShell on
 # Windows; set it to bash, zsh, fish, pwsh, ... to pin one.
@@ -133,11 +138,15 @@ SYSTEM_PROMPT = """You are aiaiai, a terminal assistant. The user describes what
 and you reply with the single {shell_name} command that does it.
 
 Rules:
-- Reply with a JSON object and nothing else: {{"command": "...", "explanation": "..."}}
+- Reply with a JSON object and nothing else:
+  {{"command": "...", "explanation": "...", "arguments": [["-r", "..."], ["/srv", "..."]]}}
 - "command" is one runnable {shell_name} command line{syntax_hint}. Chain steps if you must, but \
 never return multiple lines and never wrap it in a code fence.
 - "explanation" is at most two short sentences saying what the command does and calling out \
 anything destructive. No markdown.
+- "arguments" breaks the command down for someone learning it: one [part, meaning] pair per \
+flag, option, operand or pipeline step worth explaining, in the order they appear, each \
+meaning a few plain words. Skip parts too obvious to need it; at most 8 pairs.
 - Prefer tools that exist on the user's machine, using the context you are given. Use the real \
 file and directory names from that context.
 - If the request is impossible or too vague to turn into a command, set "command" to "" and \
@@ -608,9 +617,11 @@ def parse_answer(content: str) -> dict:
             except json.JSONDecodeError:
                 obj = None
 
+    arguments: list[tuple[str, str]] = []
     if isinstance(obj, dict):
         command = str(obj.get("command") or "").strip()
         explanation = str(obj.get("explanation") or "").strip()
+        arguments = parse_arguments(obj.get("arguments"))
     else:  # model ignored the format: first non-empty line is the command
         lines = [ln for ln in text.splitlines() if ln.strip()]
         command = lines[0].strip() if lines else ""
@@ -619,7 +630,41 @@ def parse_answer(content: str) -> dict:
     command = command.strip("`").strip()
     if command.startswith("$ "):
         command = command[2:]
-    return {"command": command, "explanation": explanation}
+    return {"command": command, "explanation": explanation, "arguments": arguments}
+
+
+def parse_arguments(raw) -> list[tuple[str, str]]:
+    """[part, meaning] pairs, tolerating the shapes models actually send:
+    lists of pairs, {"arg": .., "meaning": ..} objects, or one flat mapping."""
+    if isinstance(raw, dict):
+        raw = list(raw.items())
+    pairs = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            part, meaning = item[0], item[1]
+        elif isinstance(item, dict) and len(item) >= 2:
+            part, meaning = list(item.values())[:2]
+        else:
+            continue
+        part, meaning = str(part).strip(), str(meaning).strip()
+        if part and meaning:
+            pairs.append((part, meaning))
+    return pairs[:8]
+
+
+def describe(answer: dict, cfg: dict):
+    """The explanation and the argument breakdown, on stderr."""
+    if answer["explanation"]:
+        note(f"{DIM}{answer['explanation']}{RESET}")
+    args = answer["arguments"] if cfg.get("explain_args", True) else []
+    if not args:
+        return
+    width = min(max(len(part) for part, _ in args), 24)
+    for part, meaning in args:
+        if len(part) > width:  # too long to line up: meaning on its own line
+            note(f"  {part}\n  {' ' * width}  {DIM}{meaning}{RESET}")
+        else:
+            note(f"  {part.ljust(width)}  {DIM}{meaning}{RESET}")
 
 
 # ---------------------------------------------------------------- execution
@@ -830,10 +875,10 @@ def setup(path: str | None) -> int:
 
     mode_choice = prompt_choice(
         "What should aiaiai do with the command it comes up with?",
-        ["show it and ask before running       (confirm - safest)",
-         "print only the command, run nothing  (command)",
-         "print it with a short explanation    (explain)",
-         "just run it, no questions            (auto)"],
+        ["explain it and its arguments, then ask before running  (confirm - recommended)",
+         "print only the command, run nothing                    (command)",
+         "explain it and its arguments, run nothing              (explain)",
+         "just run it, no questions                              (auto)"],
         default={"confirm": 1, "command": 2, "explain": 3, "auto": 4}.get(cfg.get("mode"), 1),
     )
     cfg["mode"] = ("confirm", "command", "explain", "auto")[mode_choice - 1]
@@ -863,8 +908,8 @@ usage:
 
 output modes (the default comes from the config file):
   -c, --command      print only the command
-  -e, --explain      print the command and a short explanation
-  -r, --run          print it and ask before running
+  -e, --explain      explain the command and its arguments, run nothing
+  -r, --run          explain it, then ask before running (the usual default)
   -y, --yes, --auto  run it without asking
 
 other options:
@@ -1002,15 +1047,13 @@ def main(argv: list[str]) -> int:
         return 0
     if mode == "explain":
         print(command)
-        if explanation:
-            note(f"{DIM}{explanation}{RESET}")
+        describe(answer, cfg)
         if risk:
             note(f"{RED}careful:{RESET} {risk}")
         return 0
 
     note(f"{BOLD}{command}{RESET}")
-    if explanation:
-        note(f"{DIM}{explanation}{RESET}")
+    describe(answer, cfg)
 
     if mode == "auto" and (not risk or opts["force"]):
         return run(command, cfg)
