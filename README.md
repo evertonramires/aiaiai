@@ -31,8 +31,9 @@ irm https://raw.githubusercontent.com/evertonramires/aiaiai/main/install.ps1 | i
 
 The installer finds Python (and offers to install it if it is missing), puts
 `aiaiai` and the short alias `ai` on your PATH, then asks you four questions:
-which AI to use, which model, an API key if the service needs one, and what it
-should do with the commands it writes. It offers to test the connection before
+which AI to use (OpenAI, Claude Code, Ollama, LM Studio or your own endpoint),
+which model, an API key if the service needs one, and what it should do with
+the commands it writes. It offers to test the connection before
 you go.
 
 If your PATH needed changing it prints one line to copy, paste, and you are
@@ -104,7 +105,9 @@ ai --claude find every file bigger than 1G under /var   # or just for one call
 
 Under the hood it runs one `claude -p` turn with every Claude Code tool turned
 off (`--tools ""`), no MCP servers and no saved session. Claude only writes the
-answer; running it stays with aiaiai and your chosen mode. The model defaults
+answer; running it stays with aiaiai and your chosen mode. It gets the same
+context described [below](#what-it-tells-the-model), sent through Claude Code
+to Anthropic. The model defaults
 to `haiku`, which is quick and plenty for one command; `-m sonnet` or
 `model = "opus"` if you want it to think harder.
 
@@ -211,6 +214,8 @@ If your request starts with a dash, put `--` first:
 | it suggests nonsense | a bigger model helps a lot here |
 
 ## Uninstall
+
+This removes aiaiai only; Claude Code, Ollama and the rest are yours to keep.
 
 ```sh
 rm ~/.local/bin/aiaiai ~/.local/bin/ai

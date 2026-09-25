@@ -520,8 +520,10 @@ def ask_claude_code(cfg: dict, system: str, user: str, timeout: float) -> str:
         body = None
     if not isinstance(body, dict):
         detail = (proc.stderr or proc.stdout or "").strip()[:300] or f"exit code {proc.returncode}"
-        raise ClaudeCodeError(f"Claude Code failed: {detail}\n"
-                              f"  does '{argv[0]} -p hello' work? You may need to log in first.")
+        hint = ("this Claude Code is too old for aiaiai - update it with 'claude update'"
+                if "unknown option" in detail
+                else f"does '{argv[0]} -p hello' work? You may need to log in first.")
+        raise ClaudeCodeError(f"Claude Code failed: {detail}\n  {hint}")
     if body.get("is_error") or proc.returncode != 0:
         detail = str(body.get("result") or body.get("subtype") or "unknown error")[:300]
         raise ClaudeCodeError(f"Claude Code answered with an error: {detail}")
@@ -805,7 +807,9 @@ def setup(path: str | None) -> int:
         note(f"\n{DIM}the base url of any OpenAI-compatible API, "
              f"e.g. https://example.com/v1{RESET}")
         cfg["base_url"] = prompt("base url", cfg["base_url"])
-        cfg["model"] = prompt("model name", cfg["model"])
+        # a Claude Code model name means nothing to an OpenAI-style server
+        cfg["model"] = prompt("model name",
+                              DEFAULTS["model"] if cfg.get("_was_claude") else cfg["model"])
         cfg["api_key"] = prompt("api key (blank if the server needs none)", "") or "not-required"
     else:
         cfg["base_url"] = url
