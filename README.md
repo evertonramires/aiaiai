@@ -6,8 +6,14 @@ Ask your own AI for the command you meant to type, without leaving the terminal.
 $ ai how to mv all subfolders of /ORGANIZED into current folder
 mv /ORGANIZED/*/ .
 Moves every immediate subdirectory of /ORGANIZED into the working directory.
+  mv             move (not copy)
+  /ORGANIZED/*/  every folder inside /ORGANIZED; the trailing / skips files
+  .              into the current folder
 run it? [y/N/e(dit)]
 ```
+
+It tells you what the command does and what each part of it means, then asks.
+You learn the command instead of pasting it blind.
 
 One file, no dependencies, works with any OpenAI-compatible API - a local
 [Ollama](https://ollama.com) or [LM Studio](https://lmstudio.ai), an OpenAI key,
@@ -70,10 +76,13 @@ The setup picked a default for you; a flag overrides it for one call.
 
 | mode | flag | what happens |
 |---|---|---|
+| `confirm` | `-r` | **the default.** explains the command and its arguments, then asks `y / N / e(dit)` before running |
+| `explain` | `-e` | explains it the same way, runs nothing |
 | `command` | `-c` | prints only the command, runs nothing |
-| `explain` | `-e` | prints the command with a short explanation |
-| `confirm` | `-r` | prints it, then asks `y / N / e(dit)` before running |
 | `auto` | `-y` | runs it immediately |
+
+`explain_args = false` in the config keeps the one-line explanation and drops
+the argument-by-argument breakdown.
 
 Press `e` at the prompt to edit the command before it runs.
 
@@ -125,7 +134,8 @@ base_url = "http://localhost:11434/v1"   # any OpenAI-compatible endpoint
 model    = "llama3.2"
 api_key  = "not-required"
 
-mode  = "confirm"   # command | explain | confirm | auto
+mode  = "confirm"   # confirm | explain | command | auto
+explain_args = true # break the command down argument by argument
 shell = "auto"      # "auto" follows $SHELL, or PowerShell on Windows
 
 timeout = 90        # seconds to wait for the model before giving up
@@ -170,8 +180,8 @@ one call.
 
 ```
 -c --command      print only the command
--e --explain      command plus a short explanation
--r --run          ask before running
+-e --explain      explain the command and its arguments, run nothing
+-r --run          explain it, then ask before running (the default)
 -y --yes --auto   run without asking
 -m --model NAME   override the model for this call
    --url URL      override the base url

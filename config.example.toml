@@ -15,11 +15,15 @@ model    = "llama3.2"
 api_key  = "not-required"
 
 # What aiaiai does with the answer:
+#   "confirm" -> print it with a short explanation of what it does and what
+#                each argument means, then ask before running   (default)
+#   "explain" -> the same, but never run anything
 #   "command" -> print only the command
-#   "explain" -> print the command plus a short explanation
-#   "confirm" -> print it, then ask before running   (default)
 #   "auto"    -> run it immediately, no questions asked
 mode = "confirm"
+
+# Break the command down argument by argument ("-r  include subfolders").
+explain_args = true
 
 # Shell used to run commands. "auto" follows $SHELL on unix and PowerShell on
 # Windows; set it to bash, zsh, fish, pwsh, ... to pin one.
