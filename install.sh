@@ -6,7 +6,8 @@
 # or, from a clone:   ./install.sh [target-dir]
 #
 # It finds or installs Python 3.11+, puts aiaiai (and the short alias ai) on
-# your PATH, and walks you through pointing it at an AI.
+# your PATH, and walks you through pointing it at an AI: any OpenAI-compatible
+# API, or the Claude Code CLI if you already use it.
 #
 #   NO_SHORT_ALIAS=1  skip the "ai" alias
 #   NO_SETUP=1        skip the interactive configuration

@@ -5,7 +5,8 @@
 # or, from a clone:   .\install.ps1
 #
 # Finds or installs Python 3.11+, puts aiaiai (and the short alias ai) on your
-# PATH, and walks you through pointing it at an AI.
+# PATH, and walks you through pointing it at an AI: any OpenAI-compatible API,
+# or the Claude Code CLI if you already use it.
 #
 #   $env:AIAIAI_DIR = "C:\somewhere"   install somewhere else
 #   $env:AIAIAI_NO_SETUP = "1"         skip the interactive configuration
